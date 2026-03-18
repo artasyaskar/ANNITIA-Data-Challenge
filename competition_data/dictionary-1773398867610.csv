@@ -1,0 +1,21 @@
+Variable,Category,Data type,Description / units
+subject_id,Identifier,Text,Unique synthetic subject ID
+age_years,Clinical,Integer,Age in years
+sex,Clinical,Categorical,Female or Male
+bmi_kg_m2,Clinical,Decimal,Body mass index (kg/m²)
+smoking_status,Clinical,Categorical,"Never, Former, Current"
+systolic_bp_mmHg,Clinical,Integer,Systolic blood pressure (mmHg)
+diastolic_bp_mmHg,Clinical,Integer,Diastolic blood pressure (mmHg)
+heart_rate_bpm,Clinical,Integer,Resting heart rate (beats/min)
+diabetes,Clinical,Binary categorical,Yes / No
+hypertension,Clinical,Binary categorical,Yes / No
+egfr_mL_min_1_73m2,Biomarker,Decimal,Estimated GFR (mL/min/1.73m²)
+crp_mg_L,Biomarker,Decimal,C-reactive protein (mg/L)
+hba1c_pct,Biomarker,Decimal,Hemoglobin A1c (%)
+ldl_c_mg_dL,Biomarker,Decimal,LDL cholesterol (mg/dL)
+hdl_c_mg_dL,Biomarker,Decimal,HDL cholesterol (mg/dL)
+il6_pg_mL,Biomarker,Decimal,Interleukin-6 (pg/mL)
+tnf_alpha_pg_mL,Biomarker,Decimal,TNF-alpha (pg/mL)
+troponin_i_ng_L,Biomarker,Decimal,Troponin I (ng/L)
+bnp_pg_mL,Biomarker,Decimal,B-type natriuretic peptide (pg/mL)
+outcome_event_12m,Outcome,Binary integer,"0 = no event, 1 = event within 12 months"
