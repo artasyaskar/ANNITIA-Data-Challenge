@@ -8,7 +8,7 @@ import pandas as pd
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import KFold
+from sklearn.model_selection import KFold, StratifiedKFold
 
 import xgboost as xgb
 
@@ -414,6 +414,18 @@ def make_models(seed: int) -> list[SkSurvModel]:
     return [rsf, gb, coxnet, xgb_cox]
 
 
+def make_models_by_mode(seed: int, mode: str) -> list:
+    mode = str(mode).lower().strip()
+    all_models = make_models(seed)
+    if mode == "baseline":
+        return [m for m in all_models if getattr(m, "name", "") in {"rsf", "gbsa", "coxnet"}]
+    if mode == "xgb":
+        return [m for m in all_models if getattr(m, "name", "") == "xgb_cox"]
+    if mode == "blend":
+        return all_models
+    raise ValueError("mode must be one of: baseline, xgb, blend")
+
+
 def _rank_transform(x: np.ndarray) -> np.ndarray:
     x = np.asarray(x, dtype=float)
     order = np.argsort(x)
@@ -423,17 +435,56 @@ def _rank_transform(x: np.ndarray) -> np.ndarray:
     return ranks
 
 
-def _dirichlet_weight_search(
+def _make_cv_splitter(y: np.ndarray, n_splits: int, seed: int):
+    # Stratify by event indicator when possible; this stabilizes C-index estimates.
+    if y.dtype.names is None or len(y.dtype.names) < 1:
+        return KFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    event_field = y.dtype.names[0]
+    labels = np.asarray(y[event_field], dtype=int)
+    if np.unique(labels).size < 2:
+        return KFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    return StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+
+
+def _simplex_grid_weights(n_models: int, step: float = 0.05) -> np.ndarray:
+    if n_models <= 0:
+        raise ValueError("n_models must be positive")
+    if n_models == 1:
+        return np.ones((1, 1), dtype=float)
+
+    grid = np.arange(0.0, 1.0 + 1e-12, step, dtype=float)
+
+    weights: list[list[float]] = []
+    if n_models == 2:
+        for a in grid:
+            weights.append([a, 1.0 - a])
+        return np.asarray(weights, dtype=float)
+
+    if n_models == 3:
+        for a in grid:
+            for b in grid:
+                c = 1.0 - a - b
+                if c < -1e-12:
+                    continue
+                if c < 0:
+                    c = 0.0
+                weights.append([a, b, c])
+        return np.asarray(weights, dtype=float)
+
+    # n_models >= 4: do random Dirichlet (grid explodes)
+    rng = np.random.default_rng(123)
+    return rng.dirichlet(np.ones(n_models, dtype=float), size=4000).astype(float)
+
+
+def _weight_search(
     y: np.ndarray,
     oof_rank_preds: np.ndarray,
     seed: int,
-    n_samples: int = 4000,
 ) -> np.ndarray:
     if y.dtype.names is None or len(y.dtype.names) < 2:
         raise ValueError("Survival target y must be a structured array with (event, time) fields")
     event_field, time_field = y.dtype.names[0], y.dtype.names[1]
 
-    rng = np.random.default_rng(seed)
     n_models = oof_rank_preds.shape[1]
     best_w = np.ones(n_models, dtype=float) / float(n_models)
     best_c = -1.0
@@ -442,8 +493,16 @@ def _dirichlet_weight_search(
     base = oof_rank_preds @ best_w
     best_c = float(concordance_index_censored(y[event_field], y[time_field], base)[0])
 
-    for _ in range(n_samples):
-        w = rng.dirichlet(np.ones(n_models, dtype=float))
+    candidates = _simplex_grid_weights(n_models=n_models, step=0.05)
+    rng = np.random.default_rng(seed)
+    rng.shuffle(candidates)
+
+    for w in candidates:
+        w = np.asarray(w, dtype=float)
+        s = float(w.sum())
+        if s <= 0:
+            continue
+        w = w / s
         pred = oof_rank_preds @ w
         c = float(concordance_index_censored(y[event_field], y[time_field], pred)[0])
         if c > best_c:
@@ -457,20 +516,26 @@ def cv_fit_and_blend(
     y: np.ndarray,
     seed: int = 42,
     n_splits: int = 4,
+    mode: str = "blend",
 ) -> tuple[list, np.ndarray]:
-    cv = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
-    models = make_models(seed)
+    cv = _make_cv_splitter(y=y, n_splits=n_splits, seed=seed)
+    models = make_models_by_mode(seed, mode)
 
     n = X.shape[0]
     k = len(models)
     oof = np.full((n, k), np.nan, dtype=float)
 
-    for tr, va in cv.split(X):
+    if isinstance(cv, StratifiedKFold):
+        splits = cv.split(X, np.asarray(y[y.dtype.names[0]], dtype=int))
+    else:
+        splits = cv.split(X)
+
+    for tr, va in splits:
         X_tr = X.iloc[tr]
         X_va = X.iloc[va]
         y_tr = y[tr]
 
-        fold_models = make_models(seed)
+        fold_models = make_models_by_mode(seed, mode)
         for mi, m in enumerate(fold_models):
             m.fit(X_tr, y_tr)
             oof[va, mi] = m.predict_risk(X_va)
@@ -478,10 +543,10 @@ def cv_fit_and_blend(
     # Rank-transform each model's OOF predictions (robust to scale differences)
     oof_rank = np.vstack([_rank_transform(oof[:, i]) for i in range(k)]).T
 
-    weights = _dirichlet_weight_search(y=y, oof_rank_preds=oof_rank, seed=seed + 999)
+    weights = _weight_search(y=y, oof_rank_preds=oof_rank, seed=seed + 999)
 
     # Fit final models on full data
-    fitted = make_models(seed)
+    fitted = make_models_by_mode(seed, mode)
     for m in fitted:
         m.fit(X, y)
 
@@ -509,11 +574,26 @@ def fit_and_predict(train_path: str, test_path: str, output_path: str) -> None:
     X_death = build_features(df_death)
     X_test = build_features(test_df)
 
-    hep_models, hep_w = cv_fit_and_blend(X_hep, y_hep, seed=42, n_splits=4)
-    death_models, death_w = cv_fit_and_blend(X_death, y_death, seed=142, n_splits=4)
+    # mode controls model set:
+    # - baseline: rsf + gbsa + coxnet
+    # - xgb: xgboost cox only
+    # - blend: baseline + xgb
+    mode = getattr(fit_and_predict, "mode", "blend")
 
-    risk_hep = ensemble_predict(hep_models, X_test, hep_w)
-    risk_death = ensemble_predict(death_models, X_test, death_w)
+    n_splits = int(getattr(fit_and_predict, "n_splits", 4))
+    bag_seeds = int(getattr(fit_and_predict, "bag_seeds", 1))
+    seed0 = int(getattr(fit_and_predict, "seed0", 42))
+
+    def _bagged_predict(X_tr: pd.DataFrame, y_tr: np.ndarray, X_te: pd.DataFrame, seed_base: int) -> np.ndarray:
+        preds = []
+        for i in range(max(bag_seeds, 1)):
+            s = seed_base + 1000 * i
+            models, w = cv_fit_and_blend(X_tr, y_tr, seed=s, n_splits=n_splits, mode=mode)
+            preds.append(_rank_transform(ensemble_predict(models, X_te, w)))
+        return np.mean(np.vstack(preds), axis=0)
+
+    risk_hep = _bagged_predict(X_hep, y_hep, X_test, seed_base=seed0)
+    risk_death = _bagged_predict(X_death, y_death, X_test, seed_base=seed0 + 100)
 
     if "trustii_id" not in test_df.columns:
         raise ValueError("Test file must contain trustii_id")
@@ -534,7 +614,15 @@ def main() -> None:
     ap.add_argument("--train", required=True)
     ap.add_argument("--test", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--mode", default="blend", choices=["baseline", "xgb", "blend"])
+    ap.add_argument("--n_splits", type=int, default=4)
+    ap.add_argument("--bag_seeds", type=int, default=1)
+    ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
+    fit_and_predict.mode = args.mode
+    fit_and_predict.n_splits = args.n_splits
+    fit_and_predict.bag_seeds = args.bag_seeds
+    fit_and_predict.seed0 = args.seed
     fit_and_predict(args.train, args.test, args.out)
 
 
