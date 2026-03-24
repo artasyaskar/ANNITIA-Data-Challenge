@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
+from scipy.stats import skew, kurtosis
 
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
@@ -78,16 +79,20 @@ def _rowwise_last_k_mean(values: np.ndarray, k: int) -> np.ndarray:
     return out
 
 
-def _slope(values: np.ndarray) -> np.ndarray:
+def _slope(values: np.ndarray, x_values: np.ndarray | None = None) -> np.ndarray:
     n, t = values.shape
-    x = np.arange(t, dtype=float)
+    if x_values is None:
+        x_values = np.arange(t, dtype=float)
     out = np.full(n, np.nan, dtype=float)
     for i in range(n):
         y = values[i]
         m = np.isfinite(y)
         if m.sum() < 2:
             continue
-        xi = x[m]
+        if x_values.ndim == 2:
+            xi = x_values[i][m]
+        else:
+            xi = x_values[m]
         yi = y[m]
         xm = xi.mean()
         ym = yi.mean()
@@ -95,6 +100,33 @@ def _slope(values: np.ndarray) -> np.ndarray:
         if denom <= 0:
             continue
         out[i] = ((xi - xm) * (yi - ym)).sum() / denom
+    return out
+
+
+def _acceleration(values: np.ndarray, x_values: np.ndarray | None = None) -> np.ndarray:
+    n, t = values.shape
+    if x_values is None:
+        x_values = np.arange(t, dtype=float)
+    out = np.full(n, np.nan, dtype=float)
+    for i in range(n):
+        y = values[i]
+        m = np.isfinite(y)
+        if m.sum() < 3:
+            continue
+        if x_values.ndim == 2:
+            xi = x_values[i][m]
+        else:
+            xi = x_values[m]
+        yi = y[m]
+        if len(xi) < 3:
+            continue
+        # simple finite difference approximation of second derivative if points were uniform
+        # but here we use a quadratic fit for robustness
+        try:
+            coeffs = np.polyfit(xi, yi, 2)
+            out[i] = 2.0 * coeffs[0]  # y = ax^2 + bx + c -> y'' = 2a
+        except:
+            continue
     return out
 
 
@@ -132,6 +164,7 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
         feats[c] = pd.to_numeric(df[c], errors="coerce").to_numpy(dtype=float)
 
     age_cols = [c for c in df.columns if c.startswith("Age_v")]
+    age_mat = None
     if age_cols:
         age_mat = df[age_cols].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
         age_baseline = age_mat[:, 0]
@@ -147,6 +180,21 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
             continue
 
         mat = df[vcols].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+
+        # Align age_mat if needed
+        cur_age_mat = None
+        if age_mat is not None:
+            # vcols has columns like {base}_v1, {base}_v2...
+            # we need to map these to Age_v1, Age_v2...
+            # assume index in vcols matches index in Age columns
+            v_indices = []
+            for c in vcols:
+                m_v = re.search(r"_v(\d+)$", c)
+                if m_v:
+                    v_indices.append(int(m_v.group(1)) - 1)
+            if v_indices:
+                cur_age_mat = age_mat[:, v_indices]
+
         finite = np.isfinite(mat)
         count = finite.sum(axis=1).astype(float)
         frac_missing = 1.0 - (count / float(mat.shape[1]))
@@ -165,6 +213,14 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
             vmin = np.nanmin(mat, axis=1)
             vmax = np.nanmax(mat, axis=1)
 
+            # Skewness and Kurtosis for longitudinal markers
+            vskew = skew(mat, axis=1, nan_policy='omit')
+            if isinstance(vskew, np.ma.MaskedArray):
+                vskew = vskew.filled(np.nan)
+            vkurt = kurtosis(mat, axis=1, nan_policy='omit')
+            if isinstance(vkurt, np.ma.MaskedArray):
+                vkurt = vkurt.filled(np.nan)
+
         all_nan = count == 0
         if np.any(all_nan):
             mean = np.where(all_nan, np.nan, mean)
@@ -174,9 +230,14 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
             q90 = np.where(all_nan, np.nan, q90)
             vmin = np.where(all_nan, np.nan, vmin)
             vmax = np.where(all_nan, np.nan, vmax)
+            vskew = np.where(all_nan, np.nan, vskew)
+            vkurt = np.where(all_nan, np.nan, vkurt)
 
-        slope = _slope(mat)
+        slope = _slope(mat, cur_age_mat if cur_age_mat is not None else None)
+        accel = _acceleration(mat, cur_age_mat if cur_age_mat is not None else None)
         ewm = _ewm_last(mat, alpha=0.4)
+        ewm_slow = _ewm_last(mat, alpha=0.1)
+        ewm_fast = _ewm_last(mat, alpha=0.7)
 
         delta = last - first
         range_ = vmax - vmin
@@ -185,6 +246,9 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
         delta_last_mean = last - mean
         delta_last3_mean = last3 - mean
         delta_last_ewm = last - ewm
+
+        # Volatility
+        volatility = std / np.maximum(np.abs(mean), 1e-6)
 
         feats[f"{base}__count"] = count
         feats[f"{base}__frac_missing"] = frac_missing
@@ -200,12 +264,20 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
         feats[f"{base}__q90"] = q90
         feats[f"{base}__min"] = vmin
         feats[f"{base}__max"] = vmax
+        feats[f"{base}__skew"] = vskew
+        feats[f"{base}__kurt"] = vkurt
         feats[f"{base}__range"] = range_
         feats[f"{base}__slope"] = slope
+        feats[f"{base}__accel"] = accel
         feats[f"{base}__ewm"] = ewm
+        feats[f"{base}__ewm_slow"] = ewm_slow
+        feats[f"{base}__ewm_fast"] = ewm_fast
         feats[f"{base}__last_minus_mean"] = delta_last_mean
         feats[f"{base}__last3_minus_mean"] = delta_last3_mean
         feats[f"{base}__last_minus_ewm"] = delta_last_ewm
+        feats[f"{base}__ewm_diff"] = ewm - ewm_slow
+        feats[f"{base}__ewm_diff_fast"] = ewm_fast - ewm
+        feats[f"{base}__volatility"] = volatility
 
         if base.lower() in {"ast", "alt", "ggt", "bilirubin", "triglyc", "chol", "gluc_fast"}:
             feats[f"{base}__last_log1p"] = np.log1p(np.maximum(last, 0.0))
@@ -232,6 +304,32 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 
             # AST/ALT ratio (common in hepatology)
             feats["ast_alt_ratio__last"] = ast_last / np.maximum(alt_last, 1e-6)
+
+            # Longitudinal FIB-4 and APRI
+            ast_mat = df[[c for c in df.columns if c.startswith("ast_v")]].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+            alt_mat = df[[c for c in df.columns if c.startswith("alt_v")]].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+            plt_mat = df[[c for c in df.columns if c.startswith("plt_v")]].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+
+            # Use the shortest mat length
+            min_len = min(ast_mat.shape[1], alt_mat.shape[1], plt_mat.shape[1], age_mat.shape[1])
+
+            fib4_mat = (age_mat[:, :min_len] * ast_mat[:, :min_len]) / (plt_mat[:, :min_len] * np.sqrt(np.maximum(alt_mat[:, :min_len], 1e-6)))
+            apri_mat = (ast_mat[:, :min_len] / 40.0) * 100.0 / np.maximum(plt_mat[:, :min_len], 1e-6)
+
+            feats["fib4__slope"] = _slope(fib4_mat, age_mat[:, :min_len])
+            feats["apri__slope"] = _slope(apri_mat, age_mat[:, :min_len])
+            feats["fib4__mean"] = np.nanmean(fib4_mat, axis=1)
+            feats["apri__mean"] = np.nanmean(apri_mat, axis=1)
+
+            # BARD Score approximation (BMI >= 28: 1pt, AST/ALT >= 0.8: 2pts, Diabetes: 1pt)
+            bmi_last = feats.get("BMI__last", 0.0)
+            has_diabetes = feats.get("diabetes", 0.0)
+            bard = (bmi_last >= 28).astype(float) + 2.0 * (feats["ast_alt_ratio__last"] >= 0.8).astype(float) + has_diabetes
+            feats["bard_score__last"] = bard
+
+            # Fibrotest acceleration and AST/ALT interaction
+            if "fibrotest_BM_2__accel" in feats:
+                feats["fibrotest_ast_interaction"] = feats["fibrotest_BM_2__last"] * ast_last
 
     X = pd.DataFrame(feats, index=df.index)
     X = X.replace([np.inf, -np.inf], np.nan)
@@ -342,9 +440,9 @@ def make_models(seed: int) -> list[SkSurvModel]:
                 (
                     "m",
                     RandomSurvivalForest(
-                        n_estimators=800,
-                        min_samples_split=30,
-                        min_samples_leaf=10,
+                        n_estimators=1000,
+                        min_samples_split=15,
+                        min_samples_leaf=5,
                         max_features="sqrt",
                         n_jobs=-1,
                         random_state=seed,
@@ -363,9 +461,10 @@ def make_models(seed: int) -> list[SkSurvModel]:
                     "m",
                     GradientBoostingSurvivalAnalysis(
                         loss="coxph",
-                        learning_rate=0.03,
-                        n_estimators=800,
-                        max_depth=2,
+                        learning_rate=0.015,
+                        n_estimators=1000,
+                        max_depth=3,
+                        subsample=0.8,
                         random_state=seed,
                     ),
                 ),
@@ -399,17 +498,17 @@ def make_models(seed: int) -> list[SkSurvModel]:
         "eval_metric": "cox-nloglik",
         "tree_method": "hist",
         "device": "cuda",
-        "max_depth": 3,
-        "eta": 0.03,
-        "subsample": 0.8,
-        "colsample_bytree": 0.8,
-        "min_child_weight": 10.0,
-        "lambda": 1.0,
-        "alpha": 0.0,
+        "max_depth": 4,
+        "eta": 0.01,
+        "subsample": 0.7,
+        "colsample_bytree": 0.7,
+        "min_child_weight": 3.0,
+        "lambda": 2.5,
+        "alpha": 0.1,
         "seed": int(seed),
     }
 
-    xgb_cox = XGBCoxModel(name="xgb_cox", params=xgb_params, num_boost_round=2500)
+    xgb_cox = XGBCoxModel(name="xgb_cox", params=xgb_params, num_boost_round=3000)
 
     return [rsf, gb, coxnet, xgb_cox]
 
@@ -605,6 +704,10 @@ def fit_and_predict(train_path: str, test_path: str, output_path: str) -> None:
             "risk_death": risk_death.astype(float),
         }
     ).sort_values("trustii_id")
+
+    # Clip extreme ranks or ensure float precision
+    sub["risk_hepatic_event"] = sub["risk_hepatic_event"].clip(0, 1)
+    sub["risk_death"] = sub["risk_death"].clip(0, 1)
 
     sub.to_csv(output_path, index=False)
 
