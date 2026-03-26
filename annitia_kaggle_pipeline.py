@@ -1,733 +1,206 @@
-import argparse
-import re
+import argparse, re, numpy as np, pandas as pd, warnings
 from dataclasses import dataclass
-
-import numpy as np
-import pandas as pd
-from scipy.stats import skew, kurtosis
-
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import KFold, StratifiedKFold
-
+from sklearn.model_selection import StratifiedKFold
 import xgboost as xgb
-
+import lightgbm as lgb
+from catboost import CatBoostRegressor
 from sksurv.util import Surv
 from sksurv.metrics import concordance_index_censored
 from sksurv.ensemble import RandomSurvivalForest, GradientBoostingSurvivalAnalysis
 from sksurv.linear_model import CoxnetSurvivalAnalysis
 
+warnings.filterwarnings("ignore")
 
-TARGET_COLS = [
-    "evenements_hepatiques_majeurs",
-    "evenements_hepatiques_age_occur",
-    "death",
-    "death_age_occur",
-]
-
-ID_COLS_TRAIN = ["patient_id_anon"]
-ID_COLS_TEST = ["trustii_id", "patient_id_anon"]
-
-
-def _visit_bases_and_max_visits(columns: list[str]) -> tuple[list[str], dict[str, int]]:
-    pat = re.compile(r"^(.*)_v(\d+)$")
-    bases: set[str] = set()
-    maxv: dict[str, int] = {}
-    for c in columns:
-        m = pat.match(c)
-        if not m:
-            continue
-        b = m.group(1)
-        v = int(m.group(2))
-        bases.add(b)
-        maxv[b] = max(maxv.get(b, 0), v)
-    return sorted(bases), maxv
-
-
-def _rowwise_first(values: np.ndarray) -> np.ndarray:
-    mask = np.isfinite(values)
-    idx = np.where(mask, np.arange(values.shape[1])[None, :], values.shape[1])
-    first_idx = idx.min(axis=1)
-    out = np.full(values.shape[0], np.nan, dtype=float)
-    valid = first_idx < values.shape[1]
-    out[valid] = values[np.arange(values.shape[0])[valid], first_idx[valid]].astype(float)
-    return out
-
-
-def _rowwise_last(values: np.ndarray) -> np.ndarray:
-    mask = np.isfinite(values)
-    idx = np.where(mask, np.arange(values.shape[1])[None, :], -1)
-    last_idx = idx.max(axis=1)
-    out = np.full(values.shape[0], np.nan, dtype=float)
-    valid = last_idx >= 0
-    out[valid] = values[np.arange(values.shape[0])[valid], last_idx[valid]].astype(float)
-    return out
-
-
-def _rowwise_last_k_mean(values: np.ndarray, k: int) -> np.ndarray:
-    n, t = values.shape
-    out = np.full(n, np.nan, dtype=float)
-    for i in range(n):
-        y = values[i]
-        m = np.isfinite(y)
-        if not m.any():
-            continue
-        idx = np.where(m)[0]
-        tail = idx[-k:]
-        out[i] = float(np.nanmean(y[tail]))
-    return out
-
-
-def _slope(values: np.ndarray, x_values: np.ndarray | None = None) -> np.ndarray:
-    n, t = values.shape
-    if x_values is None:
-        x_values = np.arange(t, dtype=float)
-    out = np.full(n, np.nan, dtype=float)
-    for i in range(n):
-        y = values[i]
-        m = np.isfinite(y)
-        if m.sum() < 2:
-            continue
-        if x_values.ndim == 2:
-            xi = x_values[i][m]
-        else:
-            xi = x_values[m]
-        yi = y[m]
-        xm = xi.mean()
-        ym = yi.mean()
-        denom = ((xi - xm) ** 2).sum()
-        if denom <= 0:
-            continue
-        out[i] = ((xi - xm) * (yi - ym)).sum() / denom
-    return out
-
-
-def _acceleration(values: np.ndarray, x_values: np.ndarray | None = None) -> np.ndarray:
-    n, t = values.shape
-    if x_values is None:
-        x_values = np.arange(t, dtype=float)
-    out = np.full(n, np.nan, dtype=float)
-    for i in range(n):
-        y = values[i]
-        m = np.isfinite(y)
-        if m.sum() < 3:
-            continue
-        if x_values.ndim == 2:
-            xi = x_values[i][m]
-        else:
-            xi = x_values[m]
-        yi = y[m]
-        if len(xi) < 3:
-            continue
-        # simple finite difference approximation of second derivative if points were uniform
-        # but here we use a quadratic fit for robustness
-        try:
-            coeffs = np.polyfit(xi, yi, 2)
-            out[i] = 2.0 * coeffs[0]  # y = ax^2 + bx + c -> y'' = 2a
-        except:
-            continue
-    return out
-
-
-def _ewm_last(values: np.ndarray, alpha: float) -> np.ndarray:
-    n, t = values.shape
-    out = np.full(n, np.nan, dtype=float)
-    for i in range(n):
-        y = values[i]
-        m = np.isfinite(y)
-        if not m.any():
-            continue
-        yi = y[m]
-        e = float(yi[0])
-        for v in yi[1:]:
-            e = alpha * float(v) + (1.0 - alpha) * e
-        out[i] = e
-    return out
-
-
-def build_features(df: pd.DataFrame) -> pd.DataFrame:
-    bases, maxv = _visit_bases_and_max_visits(df.columns.tolist())
-
-    static_cols = [
-        c
-        for c in df.columns
-        if (c not in TARGET_COLS)
-        and not re.match(r"^(.*)_v\d+$", c)
-        and c not in ID_COLS_TRAIN
-        and c not in ID_COLS_TEST
-    ]
-
-    feats: dict[str, np.ndarray] = {}
-
-    for c in static_cols:
-        feats[c] = pd.to_numeric(df[c], errors="coerce").to_numpy(dtype=float)
-
-    age_cols = [c for c in df.columns if c.startswith("Age_v")]
-    age_mat = None
-    if age_cols:
-        age_mat = df[age_cols].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
-        age_baseline = age_mat[:, 0]
-        age_last = np.nanmax(age_mat, axis=1)
-        feats["age__baseline"] = age_baseline
-        feats["age__last"] = age_last
-        feats["age__followup"] = age_last - age_baseline
-        feats["age__n_visits"] = np.isfinite(age_mat).sum(axis=1).astype(float)
-
-    for base in bases:
-        vcols = [f"{base}_v{i}" for i in range(1, maxv[base] + 1) if f"{base}_v{i}" in df.columns]
-        if not vcols:
-            continue
-
-        mat = df[vcols].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
-
-        # Align age_mat if needed
-        cur_age_mat = None
-        if age_mat is not None:
-            # vcols has columns like {base}_v1, {base}_v2...
-            # we need to map these to Age_v1, Age_v2...
-            # assume index in vcols matches index in Age columns
-            v_indices = []
-            for c in vcols:
-                m_v = re.search(r"_v(\d+)$", c)
-                if m_v:
-                    v_indices.append(int(m_v.group(1)) - 1)
-            if v_indices:
-                cur_age_mat = age_mat[:, v_indices]
-
-        finite = np.isfinite(mat)
-        count = finite.sum(axis=1).astype(float)
-        frac_missing = 1.0 - (count / float(mat.shape[1]))
-
-        first = _rowwise_first(mat)
-        last = _rowwise_last(mat)
-        last3 = _rowwise_last_k_mean(mat, 3)
-        last5 = _rowwise_last_k_mean(mat, 5)
-
-        with np.errstate(all="ignore"):
-            mean = np.nanmean(mat, axis=1)
-            std = np.nanstd(mat, axis=1)
-            q10 = np.nanquantile(mat, 0.10, axis=1)
-            q50 = np.nanquantile(mat, 0.50, axis=1)
-            q90 = np.nanquantile(mat, 0.90, axis=1)
-            vmin = np.nanmin(mat, axis=1)
-            vmax = np.nanmax(mat, axis=1)
-
-            # Skewness and Kurtosis for longitudinal markers
-            vskew = skew(mat, axis=1, nan_policy='omit')
-            if isinstance(vskew, np.ma.MaskedArray):
-                vskew = vskew.filled(np.nan)
-            vkurt = kurtosis(mat, axis=1, nan_policy='omit')
-            if isinstance(vkurt, np.ma.MaskedArray):
-                vkurt = vkurt.filled(np.nan)
-
-        all_nan = count == 0
-        if np.any(all_nan):
-            mean = np.where(all_nan, np.nan, mean)
-            std = np.where(all_nan, np.nan, std)
-            q10 = np.where(all_nan, np.nan, q10)
-            q50 = np.where(all_nan, np.nan, q50)
-            q90 = np.where(all_nan, np.nan, q90)
-            vmin = np.where(all_nan, np.nan, vmin)
-            vmax = np.where(all_nan, np.nan, vmax)
-            vskew = np.where(all_nan, np.nan, vskew)
-            vkurt = np.where(all_nan, np.nan, vkurt)
-
-        slope = _slope(mat, cur_age_mat if cur_age_mat is not None else None)
-        accel = _acceleration(mat, cur_age_mat if cur_age_mat is not None else None)
-        ewm = _ewm_last(mat, alpha=0.4)
-        ewm_slow = _ewm_last(mat, alpha=0.1)
-        ewm_fast = _ewm_last(mat, alpha=0.7)
-
-        delta = last - first
-        range_ = vmax - vmin
-
-        # Recent-vs-history signals (often strong for progression)
-        delta_last_mean = last - mean
-        delta_last3_mean = last3 - mean
-        delta_last_ewm = last - ewm
-
-        # Volatility
-        volatility = std / np.maximum(np.abs(mean), 1e-6)
-
-        feats[f"{base}__count"] = count
-        feats[f"{base}__frac_missing"] = frac_missing
-        feats[f"{base}__first"] = first
-        feats[f"{base}__last"] = last
-        feats[f"{base}__last3"] = last3
-        feats[f"{base}__last5"] = last5
-        feats[f"{base}__delta"] = delta
-        feats[f"{base}__mean"] = mean
-        feats[f"{base}__std"] = std
-        feats[f"{base}__q10"] = q10
-        feats[f"{base}__q50"] = q50
-        feats[f"{base}__q90"] = q90
-        feats[f"{base}__min"] = vmin
-        feats[f"{base}__max"] = vmax
-        feats[f"{base}__skew"] = vskew
-        feats[f"{base}__kurt"] = vkurt
-        feats[f"{base}__range"] = range_
-        feats[f"{base}__slope"] = slope
-        feats[f"{base}__accel"] = accel
-        feats[f"{base}__ewm"] = ewm
-        feats[f"{base}__ewm_slow"] = ewm_slow
-        feats[f"{base}__ewm_fast"] = ewm_fast
-        feats[f"{base}__last_minus_mean"] = delta_last_mean
-        feats[f"{base}__last3_minus_mean"] = delta_last3_mean
-        feats[f"{base}__last_minus_ewm"] = delta_last_ewm
-        feats[f"{base}__ewm_diff"] = ewm - ewm_slow
-        feats[f"{base}__ewm_diff_fast"] = ewm_fast - ewm
-        feats[f"{base}__volatility"] = volatility
-
-        if base.lower() in {"ast", "alt", "ggt", "bilirubin", "triglyc", "chol", "gluc_fast"}:
-            feats[f"{base}__last_log1p"] = np.log1p(np.maximum(last, 0.0))
-            feats[f"{base}__ewm_log1p"] = np.log1p(np.maximum(ewm, 0.0))
-
-    if age_cols:
-        if "ast_v1" in df.columns and "plt_v1" in df.columns:
-            ast_last = feats.get("ast__last", pd.to_numeric(df.get("ast_v1"), errors="coerce").to_numpy(dtype=float))
-            plt_last = feats.get("plt__last", pd.to_numeric(df.get("plt_v1"), errors="coerce").to_numpy(dtype=float))
-            age_last = feats.get("age__last", pd.to_numeric(df[age_cols[-1]], errors="coerce").to_numpy(dtype=float))
-
-            alt_last = feats.get("alt__last", np.nan)
-            if isinstance(alt_last, float):
-                alt_last = pd.to_numeric(df.get("alt_v1"), errors="coerce").to_numpy(dtype=float)
-
-            fib4 = (age_last * ast_last) / (plt_last * np.sqrt(np.maximum(alt_last, 1e-6)))
-            feats["fib4__last"] = fib4
-
-            apri = (ast_last / 40.0) * 100.0 / np.maximum(plt_last, 1e-6)
-            feats["apri__last"] = apri
-
-            # Platelet-to-ALT ratio (inverse of liver stress)
-            feats["plt_alt_ratio__last"] = plt_last / np.maximum(alt_last, 1e-6)
-
-            # AST/ALT ratio (common in hepatology)
-            feats["ast_alt_ratio__last"] = ast_last / np.maximum(alt_last, 1e-6)
-
-            # Longitudinal FIB-4 and APRI
-            ast_mat = df[[c for c in df.columns if c.startswith("ast_v")]].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
-            alt_mat = df[[c for c in df.columns if c.startswith("alt_v")]].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
-            plt_mat = df[[c for c in df.columns if c.startswith("plt_v")]].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
-
-            # Use the shortest mat length
-            min_len = min(ast_mat.shape[1], alt_mat.shape[1], plt_mat.shape[1], age_mat.shape[1])
-
-            fib4_mat = (age_mat[:, :min_len] * ast_mat[:, :min_len]) / (plt_mat[:, :min_len] * np.sqrt(np.maximum(alt_mat[:, :min_len], 1e-6)))
-            apri_mat = (ast_mat[:, :min_len] / 40.0) * 100.0 / np.maximum(plt_mat[:, :min_len], 1e-6)
-
-            feats["fib4__slope"] = _slope(fib4_mat, age_mat[:, :min_len])
-            feats["apri__slope"] = _slope(apri_mat, age_mat[:, :min_len])
-            feats["fib4__mean"] = np.nanmean(fib4_mat, axis=1)
-            feats["apri__mean"] = np.nanmean(apri_mat, axis=1)
-
-            # BARD Score approximation (BMI >= 28: 1pt, AST/ALT >= 0.8: 2pts, Diabetes: 1pt)
-            bmi_last = feats.get("BMI__last", 0.0)
-            has_diabetes = feats.get("diabetes", 0.0)
-            bard = (bmi_last >= 28).astype(float) + 2.0 * (feats["ast_alt_ratio__last"] >= 0.8).astype(float) + has_diabetes
-            feats["bard_score__last"] = bard
-
-            # Fibrotest acceleration and AST/ALT interaction
-            if "fibrotest_BM_2__accel" in feats:
-                feats["fibrotest_ast_interaction"] = feats["fibrotest_BM_2__last"] * ast_last
-
-    X = pd.DataFrame(feats, index=df.index)
-    X = X.replace([np.inf, -np.inf], np.nan)
-    X = X.select_dtypes(include=["number"]).astype(float)
-    return X
-
-
-def prepare_survival_targets(train_df: pd.DataFrame, outcome: str) -> tuple[pd.DataFrame, np.ndarray]:
-    if outcome == "hepatic":
-        event_col = "evenements_hepatiques_majeurs"
-        age_occur_col = "evenements_hepatiques_age_occur"
-        name_event = "Hepatic_event"
-        unknown_mask = pd.Series(False, index=train_df.index)
-    elif outcome == "death":
-        event_col = "death"
-        age_occur_col = "death_age_occur"
-        name_event = "Death"
-        unknown_mask = train_df[event_col].isna()
-    else:
-        raise ValueError("outcome must be one of: hepatic, death")
-
-    age_cols = [c for c in train_df.columns if c.startswith("Age_v")]
-    age_mat = train_df[age_cols].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
-    baseline_age = age_mat[:, 0]
-    last_age = np.nanmax(age_mat, axis=1)
-
-    is_event = train_df[event_col] == 1
-    invalid = is_event & train_df[age_occur_col].isna()
-    mask = (~unknown_mask) & (~invalid)
-
-    df_valid = train_df.loc[mask].copy().reset_index(drop=True)
-
-    age_cols_v = [c for c in df_valid.columns if c.startswith("Age_v")]
-    age_mat_v = df_valid[age_cols_v].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
-    baseline_age_v = age_mat_v[:, 0]
-    last_age_v = np.nanmax(age_mat_v, axis=1)
-
-    is_event_v = (df_valid[event_col] == 1).astype(bool)
-    t = np.where(
-        is_event_v,
-        pd.to_numeric(df_valid[age_occur_col], errors="coerce").to_numpy(dtype=float) - baseline_age_v,
-        last_age_v - baseline_age_v,
-    ).astype(float)
-    t = np.maximum(t, 0.001)
-
-    y = Surv.from_arrays(event=is_event_v.to_numpy(), time=t, name_event=name_event, name_time="Time_years")
-    return df_valid, y
-
+# --- Model Wrappers ---
 
 @dataclass
 class SkSurvModel:
-    name: str
-    pipe: Pipeline
+    name: str; pipe: Pipeline
+    def fit(self, X, y): self.pipe.fit(X, y); return self
+    def predict_risk(self, X): return self.pipe.predict(X)
 
-    def fit(self, X: pd.DataFrame, y: np.ndarray) -> "SkSurvModel":
-        self.pipe.fit(X, y)
-        return self
-
-    def predict_risk(self, X: pd.DataFrame) -> np.ndarray:
-        pred = self.pipe.predict(X)
-        return np.asarray(pred, dtype=float)
-
-
-@dataclass
 class XGBCoxModel:
-    name: str
-    params: dict
-    num_boost_round: int
-    booster: xgb.Booster | None = None
-    imputer: SimpleImputer | None = None
-
-    def fit(self, X: pd.DataFrame, y: np.ndarray) -> "XGBCoxModel":
-        if y.dtype.names is None or len(y.dtype.names) < 2:
-            raise ValueError("Survival target y must be a structured array with (event, time) fields")
-        event_field, time_field = y.dtype.names[0], y.dtype.names[1]
-
-        self.imputer = SimpleImputer(strategy="median")
-        X_imp = self.imputer.fit_transform(X)
-        times = np.asarray(y[time_field], dtype=float)
-        weights = np.asarray(y[event_field], dtype=float)
-
-        dtrain = xgb.DMatrix(X_imp, label=times, weight=weights, missing=np.nan)
-        try:
-            self.booster = xgb.train(self.params, dtrain, num_boost_round=self.num_boost_round)
-        except xgb.core.XGBoostError:
-            # Some Kaggle images ship CPU-only XGBoost even when a GPU is attached.
-            # Fall back to CPU-safe params.
-            cpu_params = dict(self.params)
-            cpu_params.pop("device", None)
-            cpu_params["tree_method"] = "hist"
-            self.booster = xgb.train(cpu_params, dtrain, num_boost_round=self.num_boost_round)
+    def __init__(self, name, params, rounds): self.name, self.params, self.rounds = name, params, rounds
+    def fit(self, X, y):
+        self.imp = SimpleImputer(strategy="constant", fill_value=-999, add_indicator=True); X_i = self.imp.fit_transform(X)
+        d = xgb.DMatrix(X_i, label=y["time"], weight=y["event"])
+        self.b = xgb.train(self.params, d, num_boost_round=self.rounds)
         return self
+    def predict_risk(self, X): return self.b.predict(xgb.DMatrix(self.imp.transform(X)))
 
-    def predict_risk(self, X: pd.DataFrame) -> np.ndarray:
-        if self.booster is None or self.imputer is None:
-            raise RuntimeError("XGBCoxModel must be fit() before predict_risk().")
-        X_imp = self.imputer.transform(X)
-        dtest = xgb.DMatrix(X_imp, missing=np.nan)
-        return np.asarray(self.booster.predict(dtest), dtype=float)
+class LGBMCoxModel:
+    def __init__(self, name, params, rounds): self.name, self.params, self.rounds = name, params, rounds
+    def fit(self, X, y):
+        self.imp = SimpleImputer(strategy="constant", fill_value=-999, add_indicator=True); X_i = self.imp.fit_transform(X)
+        d = lgb.Dataset(X_i, label=y["time"], weight=y["event"])
+        self.b = lgb.train(self.params, d, num_boost_round=self.rounds)
+        return self
+    def predict_risk(self, X): return self.b.predict(self.imp.transform(X))
 
+class CatBoostCoxModel:
+    def __init__(self, name, params, iters): self.name, self.params, self.iters = name, params, iters
+    def fit(self, X, y):
+        self.imp = SimpleImputer(strategy="constant", fill_value=-999); X_i = self.imp.fit_transform(X)
+        labels = np.where(y["event"] > 0, y["time"], -y["time"])
+        self.m = CatBoostRegressor(iterations=self.iters, **self.params)
+        self.m.fit(X_i, labels, verbose=False); return self
+    def predict_risk(self, X): return self.m.predict(self.imp.transform(X))
 
-def make_models(seed: int) -> list[SkSurvModel]:
-    rsf = SkSurvModel(
-        name="rsf",
-        pipe=Pipeline(
-            steps=[
-                ("imp", SimpleImputer(strategy="median")),
-                (
-                    "m",
-                    RandomSurvivalForest(
-                        n_estimators=1000,
-                        min_samples_split=15,
-                        min_samples_leaf=5,
-                        max_features="sqrt",
-                        n_jobs=-1,
-                        random_state=seed,
-                    ),
-                ),
-            ]
-        ),
-    )
+# --- Feature Engineering ---
 
-    gb = SkSurvModel(
-        name="gbsa",
-        pipe=Pipeline(
-            steps=[
-                ("imp", SimpleImputer(strategy="median")),
-                (
-                    "m",
-                    GradientBoostingSurvivalAnalysis(
-                        loss="coxph",
-                        learning_rate=0.015,
-                        n_estimators=1000,
-                        max_depth=3,
-                        subsample=0.8,
-                        random_state=seed,
-                    ),
-                ),
-            ]
-        ),
-    )
+def build_features(df, event_ages=None):
+    df = df.copy(); pat = re.compile(r"^(.*)_v(\d+)$"); bases = {}
+    for c in df.columns:
+        m = pat.match(c)
+        if m:
+            b_low = m.group(1).lower()
+            if b_low not in bases: bases[b_low] = m.group(1)
 
-    coxnet = SkSurvModel(
-        name="coxnet",
-        pipe=Pipeline(
-            steps=[
-                ("imp", SimpleImputer(strategy="median")),
-                ("sc", StandardScaler(with_mean=True, with_std=True)),
-                (
-                    "m",
-                    CoxnetSurvivalAnalysis(
-                        l1_ratio=0.2,
-                        alpha_min_ratio=0.01,
-                        n_alphas=60,
-                        max_iter=100000,
-                    ),
-                ),
-            ]
-        ),
-    )
+    # 1. TRUNCATION: Mandatory anti-leakage
+    if event_ages is not None:
+        ev_np = event_ages.to_numpy()
+        for v in range(1, 25):
+            ac = f"Age_v{v}"
+            if ac in df.columns:
+                mask = (df[ac].to_numpy() > ev_np); mask[np.isnan(mask)] = False
+                if mask.any():
+                    cols = [ac] + [f"{o}_v{v}" for o in bases.values() if f"{o}_v{v}" in df.columns]
+                    df.loc[mask, list(set(cols))] = np.nan
 
-    # XGBoost Cox: strong on tabular. Try CUDA (if XGBoost was built with GPU support),
-    # but fall back automatically in XGBCoxModel.fit().
-    xgb_params = {
-        "objective": "survival:cox",
-        "eval_metric": "cox-nloglik",
-        "tree_method": "hist",
-        "device": "cuda",
-        "max_depth": 4,
-        "eta": 0.01,
-        "subsample": 0.7,
-        "colsample_bytree": 0.7,
-        "min_child_weight": 3.0,
-        "lambda": 2.5,
-        "alpha": 0.1,
-        "seed": int(seed),
-    }
+    age_cols = sorted([c for c in df.columns if c.lower().startswith("age_v")], key=lambda x: int(re.search(r"_v(\d+)$", x).group(1)))
+    age_mat = df[age_cols].apply(pd.to_numeric, errors="coerce").to_numpy()
+    age_last = np.nanmax(age_mat, axis=1)
+    age_first = np.array([age_mat[i, np.where(np.isfinite(age_mat[i]))[0][0]] if np.any(np.isfinite(age_mat[i])) else np.nan for i in range(df.shape[0])])
 
-    xgb_cox = XGBCoxModel(name="xgb_cox", params=xgb_params, num_boost_round=3000)
+    feats = {}
+    for c in ["gender", "T2DM", "Hypertension", "Dyslipidaemia", "bariatric_surgery"]:
+        if c in df.columns: feats[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).to_numpy()
 
-    return [rsf, gb, coxnet, xgb_cox]
+    feats["age_last"] = age_last
+    feats["obs_dur"] = age_last - age_first
+    feats["v_count"] = np.isfinite(age_mat).sum(axis=1).astype(float)
 
+    for b_low, b_orig in bases.items():
+        vcols = [f"{b_orig}_v{i}" for i in range(1, 25) if f"{b_orig}_v{i}" in df.columns]
+        if not vcols: continue
+        mat = df[vcols].apply(pd.to_numeric, errors="coerce").to_numpy()
+        v_ages = age_mat[:, [int(re.search(r"_v(\d+)$", c).group(1)) - 1 for c in vcols]]
+        finite = np.isfinite(mat)
+        count = finite.sum(axis=1).astype(float)
 
-def make_models_by_mode(seed: int, mode: str) -> list:
-    mode = str(mode).lower().strip()
-    all_models = make_models(seed)
-    if mode == "baseline":
-        return [m for m in all_models if getattr(m, "name", "") in {"rsf", "gbsa", "coxnet"}]
-    if mode == "xgb":
-        return [m for m in all_models if getattr(m, "name", "") == "xgb_cox"]
-    if mode == "blend":
-        return all_models
-    raise ValueError("mode must be one of: baseline, xgb, blend")
+        l_v, f_v, m_v = np.full(df.shape[0], np.nan), np.full(df.shape[0], np.nan), np.nanmax(mat, axis=1)
+        age_at_max, slp = np.full(df.shape[0], np.nan), np.full(df.shape[0], np.nan)
+        tsfa, vola = np.full(df.shape[0], np.nan), np.full(df.shape[0], np.nan)
 
+        # Clinical thresholds for "abnormal"
+        t_val = 40 if b_low in ["alt", "ast"] else 50 if b_low=="ggt" else 8.5 if b_low.startswith("fibs") else 0.5 if b_low.startswith("fibro") else None
 
-def _rank_transform(x: np.ndarray) -> np.ndarray:
-    x = np.asarray(x, dtype=float)
-    order = np.argsort(x)
-    ranks = np.empty_like(order, dtype=float)
-    ranks[order] = np.arange(len(x), dtype=float)
-    ranks /= max(len(x) - 1, 1)
-    return ranks
+        for i in range(df.shape[0]):
+            idx = np.where(finite[i])[0]
+            if len(idx) > 0:
+                l_v[i], f_v[i] = mat[i, idx[-1]], mat[i, idx[0]]
+                age_at_max[i] = v_ages[i, idx[np.argmax(mat[i, idx])]]
+                if len(idx) >= 2:
+                    dx = v_ages[i, idx[-1]] - v_ages[i, idx[0]]
+                    if dx > 0: slp[i] = (mat[i, idx[-1]] - mat[i, idx[0]]) / dx
+                    vola[i] = np.std(np.diff(mat[i, idx]))
+                if t_val:
+                    is_ab = (mat[i] > t_val) if b_low != "plt" else (mat[i] < 150)
+                    ab_idx = np.where(is_ab & finite[i])[0]
+                    if len(ab_idx) > 0: tsfa[i] = age_last[i] - v_ages[i, ab_idx[0]]
 
+        feats[f"{b_low}__last"], feats[f"{b_low}__max"] = l_v, m_v
+        feats[f"{b_low}__slope"], feats[f"{b_low}__vola"] = slp, vola
+        feats[f"{b_low}__tsfa"] = tsfa
+        feats[f"{b_low}__miss"] = 1.0 - (count / float(len(vcols)))
+        if t_val: feats[f"{b_low}__is_ab"] = (m_v > t_val).astype(float) if b_low != "plt" else (np.nanmin(mat, axis=1) < 150).astype(float)
 
-def _make_cv_splitter(y: np.ndarray, n_splits: int, seed: int):
-    # Stratify by event indicator when possible; this stabilizes C-index estimates.
-    if y.dtype.names is None or len(y.dtype.names) < 1:
-        return KFold(n_splits=n_splits, shuffle=True, random_state=seed)
-    event_field = y.dtype.names[0]
-    labels = np.asarray(y[event_field], dtype=int)
-    if np.unique(labels).size < 2:
-        return KFold(n_splits=n_splits, shuffle=True, random_state=seed)
-    return StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    # Combined Markers
+    if "ast__last" in feats and "alt__last" in feats and "plt__last" in feats:
+        ast, alt, plt = feats["ast__last"], feats["alt__last"], feats["plt__last"]
+        feats["fib4"] = (age_last * ast) / (plt * np.sqrt(np.maximum(alt, 1e-6)))
+        feats["apri"] = (ast / 40.0) * 100.0 / np.maximum(plt, 1e-6)
+        feats["ast_alt"] = ast / np.maximum(alt, 1e-6)
 
+    res_df = pd.DataFrame(feats, index=df.index).replace([np.inf, -np.inf], np.nan).astype(float)
+    # Filter out columns that are all NaN to avoid Imputer issues
+    res_df = res_df.dropna(axis=1, how='all')
+    return res_df
 
-def _simplex_grid_weights(n_models: int, step: float = 0.05) -> np.ndarray:
-    if n_models <= 0:
-        raise ValueError("n_models must be positive")
-    if n_models == 1:
-        return np.ones((1, 1), dtype=float)
+# --- Pipeline ---
 
-    grid = np.arange(0.0, 1.0 + 1e-12, step, dtype=float)
+def prepare_targets(df, outcome):
+    col = "evenements_hepatiques_majeurs" if outcome == "hepatic" else "death"
+    age_col = "evenements_hepatiques_age_occur" if outcome == "hepatic" else "death_age_occur"
+    mask = (~df[col].isna()) & (~((df[col] == 1) & df[age_col].isna()))
+    df_v = df.loc[mask].copy()
+    age_mat = df_v[[c for c in df.columns if c.lower().startswith("age_v")]].apply(pd.to_numeric, errors="coerce").to_numpy()
+    age_start = np.array([age_mat[i, np.where(np.isfinite(age_mat[i]))[0][0]] for i in range(df_v.shape[0])])
+    ev = (df_v[col] == 1).to_numpy()
+    t = np.where(ev, pd.to_numeric(df_v[age_col], errors="coerce").to_numpy() - age_start, np.nanmax(age_mat, axis=1) - age_start)
+    return df_v, Surv.from_arrays(event=ev, time=np.maximum(t, 0.001))
 
-    weights: list[list[float]] = []
-    if n_models == 2:
-        for a in grid:
-            weights.append([a, 1.0 - a])
-        return np.asarray(weights, dtype=float)
+def get_models(seed, n):
+    return [
+        SkSurvModel("rsf", Pipeline([("i", SimpleImputer(strategy="median")), ("m", RandomSurvivalForest(n_estimators=n, min_samples_leaf=12, random_state=seed, n_jobs=-1))])),
+        SkSurvModel("gbs", Pipeline([("i", SimpleImputer(strategy="median")), ("m", GradientBoostingSurvivalAnalysis(n_estimators=n, learning_rate=0.03, max_depth=3, random_state=seed))])),
+        XGBCoxModel("xgb", {"objective": "survival:cox", "tree_method": "hist", "learning_rate": 0.008, "max_depth": 4, "seed": seed, "verbosity": 0}, n*2),
+        LGBMCoxModel("lgb", {"objective": "regression", "learning_rate": 0.008, "num_leaves": 31, "verbose": -1, "seed": seed}, n*2),
+        CatBoostCoxModel("cat", {"loss_function": "Cox", "learning_rate": 0.015, "depth": 4, "random_seed": seed}, n)
+    ]
 
-    if n_models == 3:
-        for a in grid:
-            for b in grid:
-                c = 1.0 - a - b
-                if c < -1e-12:
-                    continue
-                if c < 0:
-                    c = 0.0
-                weights.append([a, b, c])
-        return np.asarray(weights, dtype=float)
+def _rank(x): return pd.Series(x).rank(pct=True).to_numpy()
 
-    # n_models >= 4: do random Dirichlet (grid explodes)
-    rng = np.random.default_rng(123)
-    return rng.dirichlet(np.ones(n_models, dtype=float), size=4000).astype(float)
+def train_and_predict(tr_path, te_path, out_path):
+    tr_df, te_df = pd.read_csv(tr_path), pd.read_csv(te_path)
+    # Build initial test features to define column space
+    X_te_full = build_features(te_df)
+    results = {}
 
+    for target in ["hepatic", "death"]:
+        print(f"Modeling {target}...")
+        df_v, y_v = prepare_targets(tr_df, target)
+        df_v = df_v.reset_index(drop=True)
+        X_v = build_features(df_v, df_v["evenements_hepatiques_age_occur" if target=="hepatic" else "death_age_occur"])
 
-def _weight_search(
-    y: np.ndarray,
-    oof_rank_preds: np.ndarray,
-    seed: int,
-) -> np.ndarray:
-    if y.dtype.names is None or len(y.dtype.names) < 2:
-        raise ValueError("Survival target y must be a structured array with (event, time) fields")
-    event_field, time_field = y.dtype.names[0], y.dtype.names[1]
+        # Align columns between train and test
+        common_cols = X_v.columns.intersection(X_te_full.columns)
+        X_v, X_te = X_v[common_cols], X_te_full[common_cols]
 
-    n_models = oof_rank_preds.shape[1]
-    best_w = np.ones(n_models, dtype=float) / float(n_models)
-    best_c = -1.0
+        cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+        n_m = 5
+        oof = np.zeros((X_v.shape[0], n_m))
 
-    # Always evaluate equal weights
-    base = oof_rank_preds @ best_w
-    best_c = float(concordance_index_censored(y[event_field], y[time_field], base)[0])
+        for tr_i, va_i in cv.split(X_v, y_v["event"]):
+            Xt, yt = X_v.iloc[tr_i], y_v[tr_i]
+            for i, m in enumerate(get_models(42, 250)):
+                m.fit(Xt, yt)
+                oof[va_i, i] = m.predict_risk(X_v.iloc[va_i])
 
-    candidates = _simplex_grid_weights(n_models=n_models, step=0.05)
-    rng = np.random.default_rng(seed)
-    rng.shuffle(candidates)
+        o_rank = np.column_stack([_rank(oof[:, i]) for i in range(n_m)])
+        # Optimized blend weights
+        bw, bc = np.ones(n_m)/n_m, -1
+        for _ in range(1000):
+            w = np.random.dirichlet(np.ones(n_m))
+            c = concordance_index_censored(y_v["event"], y_v["time"], o_rank @ w)[0]
+            if c > bc: bc, bw = c, w
+        print(f" OOF C-index: {bc:.4f} | Weights: {bw.round(3)}")
 
-    for w in candidates:
-        w = np.asarray(w, dtype=float)
-        s = float(w.sum())
-        if s <= 0:
-            continue
-        w = w / s
-        pred = oof_rank_preds @ w
-        c = float(concordance_index_censored(y[event_field], y[time_field], pred)[0])
-        if c > best_c:
-            best_c = c
-            best_w = w
-    return best_w
+        # Bagging on full train set
+        final_preds = []
+        for s in [42, 1337, 2026]:
+            print(f"  Bagging seed {s}...")
+            mods = [m.fit(X_v, y_v) for m in get_models(s, 600)]
+            p_mat = np.column_stack([_rank(m.predict_risk(X_te)) for m in mods])
+            final_preds.append(p_mat @ bw)
+        results[target] = np.mean(final_preds, axis=0)
 
-
-def cv_fit_and_blend(
-    X: pd.DataFrame,
-    y: np.ndarray,
-    seed: int = 42,
-    n_splits: int = 4,
-    mode: str = "blend",
-) -> tuple[list, np.ndarray]:
-    cv = _make_cv_splitter(y=y, n_splits=n_splits, seed=seed)
-    models = make_models_by_mode(seed, mode)
-
-    n = X.shape[0]
-    k = len(models)
-    oof = np.full((n, k), np.nan, dtype=float)
-
-    if isinstance(cv, StratifiedKFold):
-        splits = cv.split(X, np.asarray(y[y.dtype.names[0]], dtype=int))
-    else:
-        splits = cv.split(X)
-
-    for tr, va in splits:
-        X_tr = X.iloc[tr]
-        X_va = X.iloc[va]
-        y_tr = y[tr]
-
-        fold_models = make_models_by_mode(seed, mode)
-        for mi, m in enumerate(fold_models):
-            m.fit(X_tr, y_tr)
-            oof[va, mi] = m.predict_risk(X_va)
-
-    # Rank-transform each model's OOF predictions (robust to scale differences)
-    oof_rank = np.vstack([_rank_transform(oof[:, i]) for i in range(k)]).T
-
-    weights = _weight_search(y=y, oof_rank_preds=oof_rank, seed=seed + 999)
-
-    # Fit final models on full data
-    fitted = make_models_by_mode(seed, mode)
-    for m in fitted:
-        m.fit(X, y)
-
-    return fitted, weights
-
-
-def ensemble_predict(models: list, X: pd.DataFrame, weights: np.ndarray) -> np.ndarray:
-    preds = []
-    for m in models:
-        preds.append(_rank_transform(m.predict_risk(X)))
-    mat = np.vstack(preds).T
-    w = np.asarray(weights, dtype=float)
-    w = w / np.maximum(w.sum(), 1e-12)
-    return mat @ w
-
-
-def fit_and_predict(train_path: str, test_path: str, output_path: str) -> None:
-    train_df = pd.read_csv(train_path)
-    test_df = pd.read_csv(test_path)
-
-    df_hep, y_hep = prepare_survival_targets(train_df, outcome="hepatic")
-    df_death, y_death = prepare_survival_targets(train_df, outcome="death")
-
-    X_hep = build_features(df_hep)
-    X_death = build_features(df_death)
-    X_test = build_features(test_df)
-
-    # mode controls model set:
-    # - baseline: rsf + gbsa + coxnet
-    # - xgb: xgboost cox only
-    # - blend: baseline + xgb
-    mode = getattr(fit_and_predict, "mode", "blend")
-
-    n_splits = int(getattr(fit_and_predict, "n_splits", 4))
-    bag_seeds = int(getattr(fit_and_predict, "bag_seeds", 1))
-    seed0 = int(getattr(fit_and_predict, "seed0", 42))
-
-    def _bagged_predict(X_tr: pd.DataFrame, y_tr: np.ndarray, X_te: pd.DataFrame, seed_base: int) -> np.ndarray:
-        preds = []
-        for i in range(max(bag_seeds, 1)):
-            s = seed_base + 1000 * i
-            models, w = cv_fit_and_blend(X_tr, y_tr, seed=s, n_splits=n_splits, mode=mode)
-            preds.append(_rank_transform(ensemble_predict(models, X_te, w)))
-        return np.mean(np.vstack(preds), axis=0)
-
-    risk_hep = _bagged_predict(X_hep, y_hep, X_test, seed_base=seed0)
-    risk_death = _bagged_predict(X_death, y_death, X_test, seed_base=seed0 + 100)
-
-    if "trustii_id" not in test_df.columns:
-        raise ValueError("Test file must contain trustii_id")
-
-    sub = pd.DataFrame(
-        {
-            "trustii_id": test_df["trustii_id"].astype(int).to_numpy(),
-            "risk_hepatic_event": risk_hep.astype(float),
-            "risk_death": risk_death.astype(float),
-        }
-    ).sort_values("trustii_id")
-
-    # Clip extreme ranks or ensure float precision
-    sub["risk_hepatic_event"] = sub["risk_hepatic_event"].clip(0, 1)
-    sub["risk_death"] = sub["risk_death"].clip(0, 1)
-
-    sub.to_csv(output_path, index=False)
-
-
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--train", required=True)
-    ap.add_argument("--test", required=True)
-    ap.add_argument("--out", required=True)
-    ap.add_argument("--mode", default="blend", choices=["baseline", "xgb", "blend"])
-    ap.add_argument("--n_splits", type=int, default=4)
-    ap.add_argument("--bag_seeds", type=int, default=1)
-    ap.add_argument("--seed", type=int, default=42)
-    args = ap.parse_args()
-    fit_and_predict.mode = args.mode
-    fit_and_predict.n_splits = args.n_splits
-    fit_and_predict.bag_seeds = args.bag_seeds
-    fit_and_predict.seed0 = args.seed
-    fit_and_predict(args.train, args.test, args.out)
-
+    sub = pd.DataFrame({"trustii_id": te_df["trustii_id"], "risk_hepatic_event": results["hepatic"], "risk_death": results["death"]})
+    sub.sort_values("trustii_id").to_csv(out_path, index=False)
+    print(f"Submission saved to {out_path}")
 
 if __name__ == "__main__":
-    main()
+    train_and_predict("competition_data/Train.csv", "competition_data/Test.csv", "final_submission.csv")
